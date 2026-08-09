@@ -76,7 +76,7 @@ app = FastAPI(
 
 # Path to the saved model folder (from the Kaggle training notebook)
 # In production, this would be an absolute path or environment variable
-MODEL_PATH = "./saved_model"
+MODEL_PATH = "SAMEERSINGH213/news-classifier"
 
 logger.info(f"Loading model from {MODEL_PATH}...")
 
