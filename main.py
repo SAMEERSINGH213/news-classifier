@@ -39,6 +39,10 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Limit PyTorch to 1 CPU thread to reduce memory overhead on constrained environments
+# (Render free tier has only 512MB RAM — multi-threaded ops can cause memory spikes)
+torch.set_num_threads(1)
+
 # ── App initialization ────────────────────────────────────────────────────────
 
 # Create the FastAPI application instance
