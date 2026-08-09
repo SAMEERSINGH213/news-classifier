@@ -12,7 +12,7 @@ transformers==4.35.2
 # PyTorch CPU — the deep learning framework
 # CPU-only build is much smaller (~200MB vs ~700MB for GPU build)
 # Render free tier doesn't have GPU anyway
-torch==2.1.0+cpu
+torch==2.13.0+cpu
 --extra-index-url https://download.pytorch.org/whl/cpu
 
 # Pydantic — data validation for request/response models
