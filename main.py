@@ -18,20 +18,15 @@ from fastapi import FastAPI, HTTPException
 # instead of a string, FastAPI rejects it before our code even runs
 from pydantic import BaseModel
 
-# torch: PyTorch — the deep learning framework our model runs on
-import torch
+# numpy: for calculating probabilities from logits
+import numpy as np
 
 # AutoTokenizer: loads the same tokenizer used during training
 # Critical: must use the exact same tokenizer, or token IDs won't match
 from transformers import AutoTokenizer
 
-# AutoModelForSequenceClassification: loads DistilBERT with classification head
-from transformers import AutoModelForSequenceClassification
-
-# softmax: converts raw logits (unbounded scores) into probabilities (0 to 1, sum to 1)
-# Example: logits [-1.2, 3.4, 0.5, -0.8] → probabilities [0.02, 0.88, 0.07, 0.03]
-from torch.nn.functional import softmax
-
+# ORTModelForSequenceClassification: loads ONNX model for sequence classification
+from optimum.onnxruntime import ORTModelForSequenceClassification
 import os
 import logging
 
@@ -39,9 +34,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Limit PyTorch to 1 CPU thread to reduce memory overhead on constrained environments
-# (Render free tier has only 512MB RAM — multi-threaded ops can cause memory spikes)
-torch.set_num_threads(1)
+# Using ONNX runtime for reduced memory footprint instead of PyTorch
 
 # ── App initialization ────────────────────────────────────────────────────────
 
@@ -78,40 +71,22 @@ app = FastAPI(
 #
 # This is a fundamental pattern for serving ML models in production.
 
-# Path to the saved model folder (from the Kaggle training notebook)
-# In production, this would be an absolute path or environment variable
-MODEL_PATH = "SAMEERSINGH213/news-classifier"
+# Path to the local ONNX model folder
+MODEL_PATH = "onnx_model/"
 
-logger.info(f"Loading model from {MODEL_PATH}...")
+logger.info(f"Loading ONNX model from {MODEL_PATH}...")
 
 # Load tokenizer from the saved path
-# This ensures we use the exact same tokenizer that was used during training
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 
-# Load the fine-tuned model
-# map_location handles the case where model was trained on GPU but server runs on CPU
-model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)
+# Load the ONNX model
+# low_cpu_mem_usage=True reduces memory spikes during loading
+model = ORTModelForSequenceClassification.from_pretrained(MODEL_PATH, low_cpu_mem_usage=True)
 
-# Move model to GPU if available, otherwise keep on CPU
-# GPU inference is ~10x faster than CPU for transformer models
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = model.to(device)
+logger.info(f"ONNX Model loaded successfully")
 
-# Set model to evaluation mode
-# This disables dropout layers which are only needed during training
-# During inference, we want deterministic, stable outputs
-model.eval()
-
-logger.info(f"Model loaded successfully on {device}")
-
-# Label mapping — must match exactly what was used during training
-# id2label converts model output index to human-readable category name
-id2label = {
-    0: "World",
-    1: "Sports", 
-    2: "Business",
-    3: "Science/Tech"
-}
+# Label mapping — loaded directly from model config
+id2label = model.config.id2label
 
 # ── Request/Response models ───────────────────────────────────────────────────
 
@@ -190,45 +165,30 @@ def predict(request: PredictionRequest):
         )
     
     # Tokenize the input text
-    # This converts raw text into the numerical format DistilBERT expects
-    # return_tensors='pt' returns PyTorch tensors (not lists or numpy arrays)
-    # truncation=True: cut if longer than max_length (prevents errors)
-    # padding=True: add padding tokens if shorter than max_length
-    # max_length=128: same as training — must be consistent
+    # return_tensors='np' returns numpy arrays for ONNX Runtime
+    # max_length=64 for faster inference and lower memory usage
     inputs = tokenizer(
         request.text,
-        return_tensors='pt',
+        return_tensors='np',
         truncation=True,
         padding=True,
-        max_length=128
+        max_length=64
     )
     
-    # Move tokenized inputs to same device as model (GPU or CPU)
-    # If model is on GPU but inputs are on CPU, PyTorch throws an error
-    # Also filter out 'token_type_ids' — DistilBERT does not use it (BERT-only field)
-    inputs = {key: val.to(device) for key, val in inputs.items() if key != 'token_type_ids'}
+    # Filter out 'token_type_ids' — DistilBERT does not use it
+    if 'token_type_ids' in inputs:
+        del inputs['token_type_ids']
     
-    # Run inference — pass tokens through the model
-    # torch.no_grad() disables gradient computation during inference
-    # Gradients are only needed during training (for backpropagation)
-    # Disabling them saves memory and speeds up inference significantly
-    with torch.no_grad():
-        # Forward pass through DistilBERT
-        # inputs contains: input_ids (token IDs) + attention_mask
-        # outputs.logits shape: (1, 4) — one row, four raw scores
-        outputs = model(**inputs)
+    # Run ONNX inference
+    outputs = model(**inputs)
     
-    # Convert logits to probabilities using softmax
-    # Logits are raw scores — can be any value, don't sum to 1
-    # Softmax squashes them to (0,1) range and makes them sum to 1
-    # dim=-1 means apply softmax across the last dimension (the 4 class scores)
-    probabilities = softmax(outputs.logits, dim=-1)
+    # Convert logits to probabilities using softmax with numpy
+    logits = outputs.logits
+    exp_logits = np.exp(logits - np.max(logits, axis=-1, keepdims=True))
+    probabilities = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
     
-    # Move probabilities from GPU to CPU and convert to Python list
-    # .cpu(): move tensor from GPU memory to CPU memory
-    # .numpy(): convert PyTorch tensor to numpy array
-    # [0]: get the first (and only) batch item
-    probs = probabilities.cpu().numpy()[0]
+    # Get the first (and only) batch item
+    probs = probabilities[0]
     
     # Find the class with highest probability
     # argmax returns the index of the maximum value
@@ -276,22 +236,24 @@ def predict_batch(texts: list[str]):
         raise HTTPException(status_code=400, detail="Maximum 32 texts per batch")
     
     # Tokenize all texts at once
-    # padding=True pads all sequences to the length of the longest one in the batch
+    # return_tensors='np' returns numpy arrays for ONNX Runtime
     inputs = tokenizer(
         texts,
-        return_tensors='pt',
+        return_tensors='np',
         truncation=True,
         padding=True,
-        max_length=128
+        max_length=64
     )
     # Filter out 'token_type_ids' — DistilBERT does not accept it
-    inputs = {key: val.to(device) for key, val in inputs.items() if key != 'token_type_ids'}
+    if 'token_type_ids' in inputs:
+        del inputs['token_type_ids']
     
-    with torch.no_grad():
-        outputs = model(**inputs)
+    outputs = model(**inputs)
     
-    # probabilities shape: (batch_size, 4)
-    probabilities = softmax(outputs.logits, dim=-1).cpu().numpy()
+    # Compute softmax probabilities
+    logits = outputs.logits
+    exp_logits = np.exp(logits - np.max(logits, axis=-1, keepdims=True))
+    probabilities = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
     
     results = []
     for i, text in enumerate(texts):
