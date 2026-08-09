@@ -1,0 +1,23 @@
+# FastAPI — the web framework for building the API
+fastapi==0.104.1
+
+# Uvicorn — the ASGI server that runs FastAPI
+# (FastAPI is an async framework, it needs an async server)
+uvicorn==0.24.0
+
+# HuggingFace Transformers — loads DistilBERT model and tokenizer
+# Using CPU version to stay within Render's free tier memory limits
+transformers==4.35.2
+
+# PyTorch CPU — the deep learning framework
+# CPU-only build is much smaller (~200MB vs ~700MB for GPU build)
+# Render free tier doesn't have GPU anyway
+torch==2.1.0+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Pydantic — data validation for request/response models
+# FastAPI uses this internally, we also use it for our models
+pydantic==2.5.2
+
+# NumPy — numerical operations (used for argmax on predictions)
+numpy==1.26.2
